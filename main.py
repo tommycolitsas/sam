@@ -32,30 +32,43 @@ class SamScraper:
     def construct_slug(self, entry_id: str) -> str:
         return f"https://sam.gov/opp/{entry_id}/view"
 
+
     async def fetch_page(self, page: int, date_from: str, date_to: str) -> dict:
         """Fetch a single page with date range"""
         headers = {
             'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-            'Accept': 'application/hal+json',
+            'Accept': 'application/json, text/plain, */*',
             'Origin': 'https://sam.gov',
             'Referer': 'https://sam.gov/search',
-            'Content-Type': 'application/json'
+            'sec-ch-ua': '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+            'sec-ch-ua-mobile': '?0',
+            'sec-ch-ua-platform': '"macOS"',
+            'sec-fetch-dest': 'empty',
+            'sec-fetch-mode': 'cors',
+            'sec-fetch-site': 'same-origin'
         }
         
-        # Format dates to match SAM.gov's expected format
+        # Convert dates to the format seen in the API request
+        date_from_formatted = f"{date_from}-05:00"
+        date_to_formatted = f"{date_to}-05:00"
+        
         params = {
+            'random': int(time.time() * 1000),  # Timestamp in milliseconds
+            'index': 'opp',
             'page': page,
-            'pageSize': self.page_size,  # Changed from size to pageSize
             'sort': '-modifiedDate',
-            'index': '_all',
-            'sfm[status][is_active]': 'true',
-            'sfm[status][is_inactive]': 'true',
-            'sfm[modifiedDateRange][start]': date_from,  # Changed parameter name
-            'sfm[modifiedDateRange][end]': date_to,      # Changed parameter name
+            'size': self.page_size,
+            'mode': 'search',
+            'responseType': 'json',
+            'q': '',
+            'qMode': 'ALL',
+            'modified_date.to': date_to_formatted,
+            'modified_date.from': date_from_formatted
         }
 
-        # Debug log the exact URL being requested
-        logger.debug(f"Requesting with params: {params}")
+        # Log the exact request URL and parameters
+        url = f"{self.base_url}?{urllib.parse.urlencode(params)}"
+        logger.info(f"Requesting URL: {url}")
 
         async with self.semaphore:
             for attempt in range(3):
@@ -63,17 +76,19 @@ class SamScraper:
                     async with self.session.get(self.base_url, params=params, headers=headers) as response:
                         if response.status == 200:
                             data = await response.json()
-                            # Log the first result's date to verify filtering
                             if '_embedded' in data and 'results' in data['_embedded']:
                                 results = data['_embedded']['results']
                                 if results:
                                     first_date = results[0].get('modifiedDate')
                                     last_date = results[-1].get('modifiedDate')
                                     logger.info(f"Results date range: {first_date} to {last_date}")
+                                    logger.info(f"Number of results in this page: {len(results)}")
+                                    logger.info(f"Sample result ID: {results[0].get('_id', 'No ID')}")
                             return data
                         else:
                             text = await response.text()
                             logger.error(f"Error {response.status} fetching page {page}: {text}")
+                            logger.error(f"Failed URL: {url}")
                             if attempt < 2:
                                 await asyncio.sleep(2 ** attempt)
                 except Exception as e:
@@ -81,6 +96,7 @@ class SamScraper:
                     if attempt < 2:
                         await asyncio.sleep(2 ** attempt)
             return None
+    
         
     async def process_time_chunk(self, date_from: str, date_to: str, db_path: str) -> int:
         """Process a specific time chunk"""
