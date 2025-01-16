@@ -1,29 +1,16 @@
 import aiohttp
 import asyncio
-from typing import List, Dict
 import logging
-import json
-from datetime import datetime
+from datetime import datetime, timedelta
 import sqlite3
-from dataclasses import dataclass
-from concurrent.futures import ThreadPoolExecutor
 import time
+import json
 
-# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
-
-@dataclass
-class SamEntry:
-    id: str
-    slug: str
-    publish_date: str
-    title: str
-    type: str
-    solicitation_number: str
 
 class SamScraper:
     def __init__(self, base_url: str, page_size: int = 100, max_concurrent_requests: int = 10):
@@ -43,36 +30,30 @@ class SamScraper:
     def construct_slug(self, entry_id: str) -> str:
         return f"https://sam.gov/opp/{entry_id}/view"
 
-    async def fetch_page(self, page: int) -> Dict:
-        """Fetch a single page of results with error handling and retries"""
+    async def fetch_page(self, page: int, date_from: str, date_to: str) -> dict:
+        """Fetch a single page with date range"""
         headers = {
             'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-            'Accept': 'application/json, text/plain, */*',
-            'Accept-Encoding': 'gzip, deflate, br',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Sec-Ch-Ua': '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
-            'Sec-Ch-Ua-Mobile': '?0',
-            'Sec-Ch-Ua-Platform': '"macOS"',
+            'Accept': 'application/hal+json',  # Changed from application/json
             'Origin': 'https://sam.gov',
-            'Referer': 'https://sam.gov/search'
+            'Referer': 'https://sam.gov/search',
+            'Content-Type': 'application/json'
         }
         
         params = {
-            'random': str(int(time.time() * 1000)),
-            'index': '_all',
             'page': page,
-            'mode': 'search',
-            'sort': '-modifiedDate',
             'size': self.page_size,
-            'mfe': 'true',
-            'q': '',
-            'qMode': 'ALL'
+            'sort': '-modifiedDate',
+            'dateRangeFrom': date_from,
+            'dateRangeTo': date_to,
+            'random': str(int(time.time() * 1000)),
+            'index': '_all',  # Added index parameter
+            'sfm[status][is_active]': 'true',  # Added status filters
+            'sfm[status][is_inactive]': 'true'
         }
-        # Add a small delay between requests
-        await asyncio.sleep(1)
-        
+
         async with self.semaphore:
-            for attempt in range(3):  # Retry up to 3 times
+            for attempt in range(3):
                 try:
                     async with self.session.get(self.base_url, params=params, headers=headers) as response:
                         if response.status == 200:
@@ -82,98 +63,132 @@ class SamScraper:
                             logger.warning(f"Rate limited, waiting {wait_time} seconds")
                             await asyncio.sleep(wait_time)
                         else:
-                            logger.error(f"Error fetching page {page}: Status {response.status}")
-                            logger.error(f"Response text: {await response.text()}")
-                            await asyncio.sleep(2 ** attempt)  # Exponential backoff
+                            text = await response.text()
+                            logger.error(f"Error {response.status} fetching page {page}: {text}")
+                            await asyncio.sleep(2 ** attempt)
                 except Exception as e:
-                    logger.error(f"Exception fetching page {page}: {str(e)}")
+                    logger.error(f"Exception on page {page}: {str(e)}")
                     await asyncio.sleep(2 ** attempt)
             return None
 
-    def process_entries(self, data: Dict) -> List[SamEntry]:
-        """Process raw JSON data into SamEntry objects"""
-        entries = []
-        for result in data["_embedded"]["results"]:
-            entry = SamEntry(
-                id=result["_id"],
-                slug=self.construct_slug(result["_id"]),
-                publish_date=result["publishDate"],
-                title=result["title"],
-                type=result["type"]["value"],
-                solicitation_number=result.get("solicitationNumber", "")  # Use get() with default empty string
-            )
-            entries.append(entry)
-        return entries
+    async def process_time_chunk(self, date_from: str, date_to: str, db_path: str) -> int:
+        """Process a specific time chunk"""
+        # Get total for this time range
+        data = await self.fetch_page(0, date_from, date_to)
+        if not data or '_embedded' not in data:
+            return 0
+
+        total = data['page']['totalElements']
+        logger.info(f"Found {total} entries between {date_from} and {date_to}")
+
+        # If too many entries, need to split
+        if total > 10000:
+            return -1
+
+        # Process all pages for this chunk
+        pages = (total + self.page_size - 1) // self.page_size
+        tasks = []
+        processed = 0
+
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+
+        for page in range(pages):
+            tasks.append(self.fetch_page(page, date_from, date_to))
+            if len(tasks) >= 10:  # Process in smaller batches
+                results = await asyncio.gather(*tasks)
+                for result in results:
+                    if result and '_embedded' in result and 'results' in result['_embedded']:
+                        entries = [
+                            (item['_id'], self.construct_slug(item['_id'])) 
+                            for item in result['_embedded']['results']
+                        ]
+                        cursor.executemany('INSERT OR IGNORE INTO slugs (id, slug) VALUES (?, ?)', entries)
+                        processed += len(entries)
+                
+                conn.commit()
+                tasks = []
+                logger.info(f"Processed {processed}/{total} entries for {date_from} to {date_to}")
+                await asyncio.sleep(1)  # Small delay between batches
+
+        # Process remaining
+        if tasks:
+            results = await asyncio.gather(*tasks)
+            for result in results:
+                if result and '_embedded' in result and 'results' in result['_embedded']:
+                    entries = [
+                        (item['_id'], self.construct_slug(item['_id'])) 
+                        for item in result['_embedded']['results']
+                    ]
+                    cursor.executemany('INSERT OR IGNORE INTO slugs (id, slug) VALUES (?, ?)', entries)
+                    processed += len(entries)
+            conn.commit()
+
+        conn.close()
+        return processed
 
     async def scrape_all(self, db_path: str):
-        """Main method to scrape all pages and save to database"""
-        # First page to get total count
-        data = await self.fetch_page(0)
-        if not data:
-            logger.error("Failed to fetch first page")
-            return
-
-        total_entries = data["page"]["totalElements"]
-        total_pages = (total_entries + self.page_size - 1) // self.page_size
-        logger.info(f"Found {total_entries} total entries across {total_pages} pages")
-
+        """Main scraping method using time chunks"""
         # Initialize database
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
         cursor.execute('''
-            CREATE TABLE IF NOT EXISTS sam_entries (
+            CREATE TABLE IF NOT EXISTS slugs (
                 id TEXT PRIMARY KEY,
                 slug TEXT,
-                publish_date TEXT,
-                title TEXT,
-                type TEXT,
-                solicitation_number TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS progress (
+                last_date TEXT,
+                processed_count INTEGER,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
         conn.commit()
-
-        entries_processed = 0
-        
-        # Process pages concurrently
-        tasks = []
-        for page in range(total_pages):
-            tasks.append(self.fetch_page(page))
-            if len(tasks) >= 50:  # Process in batches of 50 pages
-                results = await asyncio.gather(*tasks)
-                for result in results:
-                    if result:
-                        entries = self.process_entries(result)
-                        entries_processed += len(entries)
-                        # Batch insert entries
-                        cursor.executemany(
-                            'INSERT OR IGNORE INTO sam_entries (id, slug, publish_date, title, type, solicitation_number) VALUES (?, ?, ?, ?, ?, ?)',
-                            [(e.id, e.slug, e.publish_date, e.title, e.type, e.solicitation_number) for e in entries]
-                        )
-                        conn.commit()
-                tasks = []
-                logger.info(f"Processed page {page}/{total_pages} - Total entries: {entries_processed:,}/{total_entries:,} ({(entries_processed/total_entries)*100:.2f}%)")
-
-        # Process any remaining tasks
-        if tasks:
-            results = await asyncio.gather(*tasks)
-            for result in results:
-                if result:
-                    entries = self.process_entries(result)
-                    cursor.executemany(
-                        'INSERT OR IGNORE INTO sam_entries (id, slug, publish_date, title, type, solicitation_number) VALUES (?, ?, ?, ?, ?, ?)',
-                        [(e.id, e.slug, e.publish_date, e.title, e.type, e.solicitation_number) for e in entries]
-                    )
-                    conn.commit()
-
         conn.close()
-        logger.info("Completed scraping all pages")
+
+        # Start from today and work backwards
+        current_date = datetime.now()
+        total_processed = 0
+
+        while True:
+            date_to = current_date.strftime("%Y-%m-%d")
+            date_from = (current_date - timedelta(days=1)).strftime("%Y-%m-%d")
+            
+            result = await self.process_time_chunk(date_from, date_to, db_path)
+            
+            if result == -1:  # Too many entries, split the day
+                mid_date = current_date - timedelta(hours=12)
+                mid_str = mid_date.strftime("%Y-%m-%d %H:%M:%S")
+                
+                # Process each half-day
+                first_half = await self.process_time_chunk(date_from, mid_str, db_path)
+                second_half = await self.process_time_chunk(mid_str, date_to, db_path)
+                
+                result = (first_half if first_half > 0 else 0) + (second_half if second_half > 0 else 0)
+            
+            if result > 0:
+                total_processed += result
+                logger.info(f"Total entries processed: {total_processed}")
+                
+                # Save progress
+                conn = sqlite3.connect(db_path)
+                cursor = conn.cursor()
+                cursor.execute('INSERT OR REPLACE INTO progress (last_date, processed_count) VALUES (?, ?)',
+                             (date_from, total_processed))
+                conn.commit()
+                conn.close()
+            
+            current_date = current_date - timedelta(days=1)
+            await asyncio.sleep(1)  # Delay between days
 
 async def main():
     base_url = "https://sam.gov/api/prod/sgs/v1/search"
-    db_path = "sam_entries.db"
+    db_path = "sam_slugs.db"
     
-    async with SamScraper(base_url, page_size=100) as scraper:
+    async with SamScraper(base_url) as scraper:
         await scraper.scrape_all(db_path)
 
 if __name__ == "__main__":
