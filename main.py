@@ -30,6 +30,7 @@ class SamScraper:
         self.page_size = page_size
         self.semaphore = asyncio.Semaphore(max_concurrent_requests)
         self.session = None
+        self.failed_requests = []
         
     async def __aenter__(self):
         self.session = aiohttp.ClientSession()
@@ -42,7 +43,7 @@ class SamScraper:
     def construct_slug(self, entry_id: str) -> str:
         return f"https://sam.gov/opp/{entry_id}/view"
 
-    async def fetch_page(self, page: int, date_from: str, date_to: str) -> dict:
+    async def fetch_page(self, page: int, date_from: str, date_to: str, cursor=None) -> dict:
         """Fetch a single page with date range"""
         headers = {
             'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
@@ -93,86 +94,170 @@ class SamScraper:
                             if attempt < 2:
                                 await asyncio.sleep(2 ** attempt)
                 except Exception as e:
-                    logger.error(f"Exception on page {page}: {str(e)}")
+                    error_msg = str(e)
+                    logger.error(f"Failed request: date_from={date_from}, date_to={date_to}, page={page}, error={error_msg}")
+                    
+                    if cursor: 
+                        try:
+                            cursor.execute('''
+                                INSERT INTO failed_requests (date_from, date_to, page, error)
+                                VALUES (?, ?, ?, ?)
+                            ''', (date_from, date_to, page, error_msg))
+                            cursor.connection.commit()  
+                        except Exception as db_error:
+                            logger.error(f"Failed to log error to database: {str(db_error)}")
+
                     if attempt < 2:
                         await asyncio.sleep(2 ** attempt)
             return None
     
-    async def process_time_chunk(self, date_from: str, date_to: str, db_path: str) -> int:
-        """Process a specific time chunk"""
-        data = await self.fetch_page(0, date_from, date_to)
-        if not data or '_embedded' not in data:
-            return 0
-
-        total = data['page']['totalElements']
-        logger.info(f"Found {total} entries between {date_from} and {date_to}")
-
-        if total > 10000:
-            return -1
-
-        pages = (total + self.page_size - 1) // self.page_size
-        tasks = []
-        processed = 0
-
+    async def retry_failed_requests(self, db_path: str):
+        """Retry failed requests specifically"""
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
+        
+        try:
+            cursor.execute('''
+                SELECT date_from, date_to, page 
+                FROM failed_requests 
+                WHERE retry_count < 3 
+                ORDER BY created_at
+            ''')
+            
+            failed_requests = cursor.fetchall()
+            for date_from, date_to, page in failed_requests:
+                try:
+                    result = await self.fetch_page(page, date_from, date_to, cursor)
+                    if result:
+                        self._process_and_insert_results([result], cursor)
+                        cursor.execute('''
+                            DELETE FROM failed_requests 
+                            WHERE date_from = ? AND date_to = ? AND page = ?
+                        ''', (date_from, date_to, page))
+                    else:
+                        cursor.execute('''
+                            UPDATE failed_requests 
+                            SET retry_count = retry_count + 1,
+                                last_retry = CURRENT_TIMESTAMP
+                            WHERE date_from = ? AND date_to = ? AND page = ?
+                        ''', (date_from, date_to, page))
+                    conn.commit()
+                except Exception as e:
+                    logger.error(f"Retry failed for {date_from} to {date_to}, page {page}: {str(e)}")
+        finally:
+            conn.close()
 
-        for page in range(pages):
-            tasks.append(self.fetch_page(page, date_from, date_to))
-           
-            if len(tasks) >= 10:
+    async def process_time_chunk(self, date_from: str, date_to: str, db_path: str) -> int:
+        """Process a specific time chunk"""
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        
+        try:
+            data = await self.fetch_page(0, date_from, date_to, cursor)
+            if not data or '_embedded' not in data:
+                return 0
+
+            total = data['page']['totalElements']
+            logger.info(f"Found {total} entries between {date_from} and {date_to}")
+
+            if total > 10000:
+                return -1
+
+            pages = (total + self.page_size - 1) // self.page_size
+            tasks = []
+            processed = 0
+
+            for page in range(pages):
+                tasks.append(self.fetch_page(page, date_from, date_to, cursor))
+               
+                if len(tasks) >= 10:
+                    results = await asyncio.gather(*tasks)
+                    processed += self._process_and_insert_results(results, cursor)
+                    conn.commit()
+                    tasks = []
+                    logger.info(f"Processed {processed}/{total} entries for {date_from} to {date_to}")
+                    await asyncio.sleep(1)
+
+            if tasks:
                 results = await asyncio.gather(*tasks)
-                # insert batch into local SQLite / Supabase
                 processed += self._process_and_insert_results(results, cursor)
                 conn.commit()
-                tasks = []
-                logger.info(f"Processed {processed}/{total} entries for {date_from} to {date_to}")
-                await asyncio.sleep(1) 
 
-        
-        if tasks:
-            results = await asyncio.gather(*tasks)
-            processed += self._process_and_insert_results(results, cursor)
-            conn.commit()
-
-        conn.close()
-        return processed
+            return processed
+        finally:
+            conn.close()
 
     def _process_and_insert_results(self, fetch_results: list, cursor) -> int:
-        """
-        Helper method to handle inserting results into both
-        local DB (slugs) and Supabase (full JSON).
-        """
         batch_processed = 0
-        supabase_rows = []  
+        existing_ids = set()
+
+        ids_to_check = [
+            item['_id'] 
+            for result in fetch_results 
+            if result and '_embedded' in result and 'results' in result['_embedded']
+            for item in result['_embedded']['results']
+        ]
+        
+        cursor.execute('SELECT id FROM slugs WHERE id IN ({})'.format(
+            ','.join('?' * len(ids_to_check))), ids_to_check)
+        existing_ids = {row[0] for row in cursor.fetchall()}
+
+        new_records = []
+        update_records = []
+        sqlite_inserts = []
 
         for result in fetch_results:
             if result and '_embedded' in result and 'results' in result['_embedded']:
                 for item in result['_embedded']['results']:
-                   
-                    slug_tuple = (item['_id'], self.construct_slug(item['_id']))
-                    cursor.execute('INSERT OR IGNORE INTO slugs (id, slug) VALUES (?, ?)', slug_tuple)
-                   
                     try:
-                        json_str = json.dumps(item)
-                        json_obj = json.loads(json_str)
-                    
-                        supabase_rows.append({
-                            "id": item["_id"],
-                            "metadata": json_obj  # parsed json object queryable in jsonb column
-                        })
+                        json_obj = json.loads(json.dumps(item))  # validate JSON
+                        record = {"id": item["_id"], "metadata": json_obj}
+                        
+                        if item['_id'] in existing_ids:
+                            update_records.append(record)
+                        else:
+                            new_records.append(record)
+                            sqlite_inserts.append((item['_id'], self.construct_slug(item['_id'])))
+                        
                         batch_processed += 1
                     except json.JSONDecodeError as e:
                         logger.error(f"JSON parsing error for item {item['_id']}: {str(e)}")
                         continue
 
-        if supabase_rows:
+        if sqlite_inserts:
+            cursor.executemany('INSERT OR IGNORE INTO slugs (id, slug) VALUES (?, ?)', 
+                              sqlite_inserts)
+
+        BATCH_SIZE = 100  
+
+        # handle new records
+        for i in range(0, len(new_records), BATCH_SIZE):
+            batch = new_records[i:i + BATCH_SIZE]
             try:
-                supabase.table("sam_data").insert(supabase_rows).execute()
-                logger.info(f"Successfully inserted {len(supabase_rows)} rows into Supabase")
+                supabase.table("sam_data").insert(batch).execute()
+                logger.info(f"Inserted batch of {len(batch)} new records")
             except Exception as ex:
-                logger.error(f"Supabase insertion failed: {str(ex)}")
-                logger.error(f"Failed batch size: {len(supabase_rows)}")
+                logger.error(f"Batch insert failed: {str(ex)}")
+                # individual fallback with insert instead of upsert
+                for record in batch:
+                    try:
+                        supabase.table("sam_data").insert(record).execute()
+                    except Exception as row_ex:
+                        logger.error(f"Failed to insert {record['id']}: {str(row_ex)}")
+
+        # handle updates
+        for i in range(0, len(update_records), BATCH_SIZE):
+            batch = update_records[i:i + BATCH_SIZE]
+            try:
+                supabase.table("sam_data").upsert(batch, on_conflict="id").execute()
+                logger.info(f"Updated batch of {len(batch)} records")
+            except Exception as ex:
+                logger.error(f"Batch update failed: {str(ex)}")
+                for record in batch:
+                    try:
+                        supabase.table("sam_data").upsert(record, on_conflict="id").execute()
+                    except Exception as row_ex:
+                        logger.error(f"Failed to update {record['id']}: {str(row_ex)}")
 
         return batch_processed
 
@@ -194,11 +279,23 @@ class SamScraper:
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS failed_requests (
+                date_from TEXT,
+                date_to TEXT,
+                page INTEGER,
+                error TEXT,
+                retry_count INTEGER DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_retry TIMESTAMP
+            )
+        ''')
+
         conn.commit()
         conn.close()
 
         current_date = datetime.now()
-        cutoff_date = datetime(2024, 1, 12)  # adjust for testing
+        cutoff_date = datetime(2024, 1, 14)  # adjust for testing
         total_processed = 0
 
         while current_date > cutoff_date:
@@ -246,7 +343,21 @@ async def main():
     db_path = "sam_slugs.db"
 
     async with SamScraper(base_url) as scraper:
-        await scraper.scrape_all(db_path)
+        try:
+            await scraper.scrape_all(db_path)
+        finally:
+            # retry failed requests before exiting
+            await scraper.retry_failed_requests(db_path)
+
+        # failure report
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute('SELECT COUNT(*) FROM failed_requests')
+        failed_count = cursor.fetchone()[0]
+        
+        if failed_count > 0:
+            logger.warning(f"\nThere are {failed_count} failed requests remaining")
+            logger.warning("Run the retry_failed_requests() method separately to attempt recovery")
 
 if __name__ == "__main__":
     asyncio.run(main())
