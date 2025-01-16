@@ -13,8 +13,8 @@ Collect all contract data from [SAM.gov](https://sam.gov/)
 
 ### Clone the repository:
 ```bash
-git clone <repository-url>
-cd <repository-name>
+git clone https://github.com/tommycolitsas/sam.git
+cd sam
 ```
 
 ### Create and activate a virtual environment:
