@@ -176,12 +176,13 @@ class SamScraper:
         conn.commit()
         conn.close()
 
-        # Start from today and work backwards for 10 days
+        
         current_date = datetime.now()
-        end_date = current_date - timedelta(days=10)  # Limit to 10 days
+        cutoff_date = datetime(2000, 1, 1) ## change this for testing
+
         total_processed = 0
 
-        while current_date > end_date:  # Will stop after 10 days
+        while current_date > cutoff_date:
             date_to = current_date.strftime("%Y-%m-%d")
             date_from = (current_date - timedelta(days=1)).strftime("%Y-%m-%d")
             
@@ -219,7 +220,7 @@ class SamScraper:
 
         logger.info(f"\n=== Scraping complete! ===")
         logger.info(f"Total entries processed: {total_processed:,}")
-        logger.info(f"Date range: {end_date.strftime('%Y-%m-%d')} to {datetime.now().strftime('%Y-%m-%d')}")
+        logger.info(f"Date range: {cutoff_date.strftime('%Y-%m-%d')} to {datetime.now().strftime('%Y-%m-%d')}")
 
 async def main():
     base_url = "https://sam.gov/api/prod/sgs/v1/search"
