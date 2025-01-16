@@ -152,15 +152,20 @@ class SamScraper:
                    
                     slug_tuple = (item['_id'], self.construct_slug(item['_id']))
                     cursor.execute('INSERT OR IGNORE INTO slugs (id, slug) VALUES (?, ?)', slug_tuple)
-
                    
-                    supabase_rows.append({
-                        "id": item["_id"],
-                        "metadata": json.dumps(item)
-                    })
-                    batch_processed += 1
+                    try:
+                        json_str = json.dumps(item)
+                        json_obj = json.loads(json_str)
+                    
+                        supabase_rows.append({
+                            "id": item["_id"],
+                            "metadata": json_obj  # parsed json object queryable in jsonb column
+                        })
+                        batch_processed += 1
+                    except json.JSONDecodeError as e:
+                        logger.error(f"JSON parsing error for item {item['_id']}: {str(e)}")
+                        continue
 
-       
         if supabase_rows:
             try:
                 supabase.table("sam_data").insert(supabase_rows).execute()
