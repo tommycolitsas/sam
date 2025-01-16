@@ -15,3 +15,5 @@ __pycache__/
 # Ignore IDE/editor configuration files
 .vscode/
 *.swp
+
+.env
