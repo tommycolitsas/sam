@@ -7,13 +7,11 @@ def analyze_database():
     cursor = conn.cursor()
     
     print("\n=== Database Analysis ===")
-    
-    # Check tables
+  
     cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
     tables = cursor.fetchall()
     print("\nTables in database:", [table[0] for table in tables])
     
-    # Check slugs table
     try:
         cursor.execute('SELECT COUNT(*) FROM slugs')
         total_slugs = cursor.fetchone()[0]
@@ -30,7 +28,6 @@ def analyze_database():
     except sqlite3.OperationalError as e:
         print(f"Error accessing slugs table: {e}")
     
-    # Check progress table
     try:
         cursor.execute('SELECT * FROM progress ORDER BY updated_at DESC LIMIT 5')
         progress_entries = cursor.fetchall()
