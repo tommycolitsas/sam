@@ -44,7 +44,7 @@ class SamScraper:
         return f"https://sam.gov/opp/{entry_id}/view"
 
     async def fetch_page(self, page: int, date_from: str, date_to: str, cursor=None) -> dict:
-        """Fetch a single page with date range"""
+        """Fetch single page with date range"""
         headers = {
             'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
             'Accept': 'application/json, text/plain, */*',
@@ -111,7 +111,7 @@ class SamScraper:
                         await asyncio.sleep(2 ** attempt)
             return None
     
-    async def retry_failed_requests(self, db_path: str):
+    async def retry_failed_requests(self, db_path: str): 
         """Retry failed requests specifically"""
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
