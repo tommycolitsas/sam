@@ -17,3 +17,4 @@ __pycache__/
 *.swp
 
 .env
+sam_slugs.db
