@@ -295,7 +295,7 @@ class SamScraper:
         conn.close()
 
         current_date = datetime.now()
-        cutoff_date = datetime(2024, 1, 14)  # adjust for testing
+        cutoff_date = datetime(2000, 1, 1)  # adjust for testing
         total_processed = 0
 
         while current_date > cutoff_date:
